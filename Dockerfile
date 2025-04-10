@@ -4,7 +4,6 @@ FROM python:3.11-slim
 # Directorio de trabajo dentro del contenedor
 WORKDIR /app
 
-# Copiar los archivos del proyecto desde el subdirectorio `app/`
 COPY app/ .
 
 # Instalar dependencias necesarias
@@ -13,7 +12,8 @@ RUN pip install --no-cache-dir \
     elasticsearch \
     requests \
     sentence-transformers \
-    numpy
+    numpy \
+    redis
 
 # Exponer el puerto que usará el servidor web
 EXPOSE 5000
