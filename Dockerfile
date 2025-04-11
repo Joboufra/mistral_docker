@@ -1,22 +1,31 @@
-# Imagen base ligera de Python 3.11
-FROM python:3.11-slim
+# Etapa 1: build
+FROM python:3.11-slim-bullseye AS builder
 
-# Directorio de trabajo dentro del contenedor
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN pip install --upgrade pip && \
+    pip install --user --no-cache-dir -r requirements.txt
+
+# Etapa 2: final image (runtime)
+FROM python:3.11-slim-bullseye
+
+WORKDIR /app
+
+# Copiamos solo lo necesario desde la etapa de build
+COPY --from=builder /root/.local /root/.local
 COPY app/ .
 
-# Instalar dependencias necesarias
-RUN pip install --no-cache-dir \
-    flask \
-    elasticsearch \
-    requests \
-    sentence-transformers \
-    numpy \
-    redis
+# Variables de entorno para que Python no genere .pyc y loguee en consola
+ENV PATH=/root/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1
 
-# Exponer el puerto que usará el servidor web
 EXPOSE 5000
 
-# Comando por defecto al iniciar el contenedor
 CMD ["python", "server.py"]

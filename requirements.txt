@@ -1,0 +1,6 @@
+flask
+elasticsearch
+requests
+sentence-transformers
+numpy
+redis
