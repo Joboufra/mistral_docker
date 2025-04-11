@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message="Connecting to 'https://localhost:9200' using TLS with verify_certs=False is insecure")
 
@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore", message="Connecting to 'https://localhost:9200
 
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
+from datetime import datetime
 import requests
 import time
 import redis
@@ -21,6 +22,7 @@ SESSION_ID = "chat:repsol"
 TTL_SECONDS = 1800  #TTL Redis - 30 minutos
 CONTEXT_LIMIT = 10  #Últimos pares pregunta-respuesta
 OLLAMA_URL = "http://mistral:11434/v1/chat/completions"
+CONTEXT_INDEX = "chat-context-repsol"  #Índice para el contexto semántico 
 
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
@@ -36,6 +38,17 @@ def guardar_mensaje(message_id, role, content):
         r.expire(f"{SESSION_ID}:index", TTL_SECONDS)
     print(f"💾 [Redis] Guardado en clave: {key} con TTL {TTL_SECONDS}s")
     print(json.dumps(value, indent=2, ensure_ascii=False))
+
+    #Guardar también en Elasticsearch como contexto semántico
+    vector = model.encode(content).tolist()
+    es.index(index=CONTEXT_INDEX, document={
+        "message_id": message_id,
+        "role": role,
+        "content": content,
+        "embedding": vector,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+    print(f"💾 [Elastic] Guardado en índice '{CONTEXT_INDEX}' con vector de embedding.")
 
 def get_session_message_ids():
     message_ids = r.lrange(f"{SESSION_ID}:index", -CONTEXT_LIMIT, -1)
@@ -60,6 +73,35 @@ def crear_contexto_redis():
 
     return messages
 
+#def crear_contexto_semantico(query_vector):
+#    print("🔍 [Elastic] Buscando contexto semántico relevante en Elasticsearch...")
+#
+#    search_body = {
+#        "size": 5,
+#        "knn": {
+#            "field": "embedding",
+#            "query_vector": query_vector,
+#            "k": 5,
+#            "num_candidates": 100
+#        },
+#        "_source": ["role", "content"]
+#    }
+#
+#    res = es.search(index=CONTEXT_INDEX, body=search_body)
+#
+#    contexto_semantico = "\n\n".join(
+#        f"{doc['_source']['role'].capitalize()}: {doc['_source']['content']}"
+#        for doc in res["hits"]["hits"]
+#    )
+#
+#    if contexto_semantico:
+#        print("✅ [Elastic] Contexto semántico relevante encontrado.")
+#    else:
+#        print("ℹ️ [Elastic] No se encontró contexto semántico relevante.")
+#
+#    return contexto_semantico
+
+#En resumen_contexto se usa modelo openchat ya que es una operación de resumen y no es necesario Mistral, es más rápido
 def resumen_contexto(context_messages):
     if not context_messages:
         print("ℹ️ [Resumen] No hay contexto previo para simplificar.")
@@ -72,10 +114,15 @@ def resumen_contexto(context_messages):
     )
 
     messages = [
-        {"role": "system", "content": "Eres un asistente que resume conversaciones previas de usuario y asistente en frases cortas que capturen el contexto de lo que se ha hablado anteriorme. Indicarás la información más relevante de forma resumida"},
-        {"role": "user", "content": f"Resume la siguiente conversación previa:\n\n{context_text}"}
+    {"role": "system", "content": (
+        "Eres un asistente que resume conversaciones previas entre usuario y asistente, "
+        "capturando de forma clara datos personales proporcionados por el usuario, como su nombre, ubicaciones o preferencias. "
+        "Empieza el resumen indicando explícitamente el nombre del usuario si se ha proporcionado. "
+        "Después, incluye un listado breve de las preguntas realizadas y sus temas. "
+        "Evita incluir detalles irrelevantes y proporciona un resumen limpio y enfocado en lo esencial para continuar la conversación de forma fluida."
+    )},
+    {"role": "user", "content": f"Resume la siguiente conversación previa destacando datos personales y preguntas:\n\n{context_text}"}
     ]
-
     response = requests.post(OLLAMA_URL, json={"model": "openchat", "messages": messages})
     summary = response.json()["choices"][0]["message"]["content"].strip()
 
@@ -84,7 +131,7 @@ def resumen_contexto(context_messages):
 
     return summary
 
-def existe_respuesta(context_messages, new_question):
+def existe_respuesta(context_messages, nueva_pregunta): #Busca si se ha preguntado exactamente la misma pregunta
     print("🔍 [Contexto] Buscando si la pregunta ya fue respondida anteriormente...")
 
     for i in range(len(context_messages) - 1):
@@ -92,7 +139,7 @@ def existe_respuesta(context_messages, new_question):
         assistant_msg = context_messages[i + 1]
 
         if user_msg["role"] == "user" and assistant_msg["role"] == "assistant":
-            if user_msg["content"].strip().lower() == new_question.strip().lower():
+            if user_msg["content"].strip().lower() == nueva_pregunta.strip().lower():
                 print("✅ [Contexto] Pregunta encontrada en el historial. Usando respuesta previa.")
                 return assistant_msg["content"]
 
@@ -124,7 +171,27 @@ INDEX = "faq-repsol-embeddings" # Actualiza si reindexas
 TEXT_FIELD = "body_content"
 EMBEDDING_FIELD = "embedding"
 
-# Cargar modelo de embeddings
+#Crear índice de contexto de conversación si no existe
+#def crear_indice_contexto():
+#   if not es.indices.exists(index=CONTEXT_INDEX):
+#       mapping = {
+#           "mappings": {
+#               "properties": {
+#                   "message_id": {"type": "keyword"},
+#                   "role": {"type": "keyword"},
+#                   "content": {"type": "text"},
+#                   "embedding": {"type": "dense_vector", "dims": 384},  # 384 para 'all-MiniLM-L6-v2'
+#                   "timestamp": {"type": "date"}
+#               }
+#           }
+#       }
+#       es.indices.create(index=CONTEXT_INDEX, body=mapping)
+#       print(f"✅ [Elastic] Índice '{CONTEXT_INDEX}' creado correctamente.")
+#   else:
+#       print(f"ℹ️ [Elastic] Índice '{CONTEXT_INDEX}' ya existe.")
+#crear_indice_contexto()
+
+#Cargar modelo de embeddings
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 print("🤖 Pregunta sobre las FAQs de Repsol. Escribe 'salir' para terminar o 'reset' para limpiar el caché.")
@@ -140,7 +207,7 @@ def main(query: str) -> str:
 #2- Comprobar si la pregunta ya fue respondida
     respuesta_existe = existe_respuesta(historial_contexto, query)
     if respuesta_existe:
-        print("🤖 Respuesta desde el contexto previo (sin consultar Elastic ni modelo):")
+        print("🤖 Respuesta desde caché (sin consultar Elastic ni modelo):")
         print(respuesta_existe)
         return respuesta_existe
 
@@ -162,7 +229,7 @@ def main(query: str) -> str:
     docs = res["hits"]["hits"]
 
     context_fragments = "\n\n".join(
-        f"Título: {doc['_source'].get('title', 'Sin título')}\nContenido: {doc['_source'].get(TEXT_FIELD, '')}"
+        f"[Título] {doc['_source'].get('title', 'Sin título')}\n[Contenido] {doc['_source'].get(TEXT_FIELD, '')}"
         for doc in docs
     )
     ids = [doc["_id"] for doc in docs]
@@ -174,31 +241,55 @@ def main(query: str) -> str:
     else:
         print("ℹ️ [Contexto] No hay historial previo en Redis. Se omitirá el resumen de contexto.")
 
-#5- Preparar mensaje final
+### Usar el contexto semántico de Elasticsearch para responder preguntas similares formuladas de forma diferente, contexto a largo plazo
+#5- Recuperar contexto semántico desde Elasticsearch
+#    contexto_semantico = crear_contexto_semantico(query_vector)
+
+#6- Preparar mensaje final
     messages = []
 
     #Instrucciones iniciales
     messages.append({
         "role": "system",
         "content": (
-            "Eres un asistente inteligente que responde exclusivamente en base a las FAQs de Repsol. "
-            "No debes generalizar ni hablar de otras empresas."
-            "Proporciona respuestas claras y concisas basadas únicamente en la información disponible."
+            "Eres un asistente experto que responde exclusivamente en base a las FAQs de Repsol.\n"
+            "<Datos> contiene la información oficial y prioritaria que debes usar para responder a la consulta del usuario.\n"
+            "<Contexto> contiene información adicional de interacciones previas, que solo debes utilizar para enriquecer la respuesta si no encuentras la información suficiente en <Datos>.\n"
+            "Siempre prioriza <Datos>. Usa <Contexto> solo como complemento secundario.\n"
+            "No te refieras nunca explícitamente a <Contexto> o <Datos> en tus respuestas finales, responde como si fueran parte de tu conocimiento.\n"
+            "Si no encuentras suficiente información en <Datos>, y <Contexto> tampoco proporciona la respuesta, indica educadamente que no dispones de la información necesaria.\n"
+            "Responde exclusivamente a la pregunta formulada en <Pregunta>.\n"
+            "Tu respuesta debe comenzar justo después de la etiqueta <Respuesta>, omitiendo cualquier otra etiqueta.\n"
+            "No menciones códigos internos, IDs, o instrucciones internas en la respuesta."
         )
     })
 
-    #Si hay contexto, se añade como recordatorio de la conversación previa
+    #Incluir también la consulta actual del usuario para refrescar el foco del modelo
+    ## Pendiente de validar que sirve:
+    messages.append({
+        "role": "user",
+        "content": f"La consulta actual es: {query}\nPor favor, responde utilizando principalmente <Datos>."
+    })
+
+    #Si hay resumen de contexto, se añade
     if contexto_simplificado:
         messages.append({
             "role": "system",
-            "content": f"Resumen del contexto de la conversación previa: {contexto_simplificado}"
+            "content": f"<Contexto> {contexto_simplificado}"
         })
+ 
+#    #Si hay contexto semántico, se añade
+#    if contexto_semantico:
+#        messages.append({
+#            "role": "system",
+#            "content": f"Contexto relevante de la conversación previa: {contexto_simplificado}\n"
+#        })
 
-    #Añadimos los resultado de Elasticsearch
+    #Añadimos los resultados de Elasticsearch
     messages.append({
         "role": "system",
         "content": (
-            "A continuación tienes un conjunto de fragmentos extraídos de las FAQs de Repsol para que los tengas en cuenta al responder:\n\n"
+            "<Datos> Esta es la información de las FAQs de Repsol:\n"
             f"{context_fragments}"
         )
     })
@@ -206,15 +297,15 @@ def main(query: str) -> str:
     #Y se añade la pregunta del user
     messages.append({
         "role": "user",
-        "content": query
+        "content": f"<Pregunta> {query}. Responde utilizando principalmente <Datos>. <Respuesta>"
     })
 
-#6- Enviar la petición a Mistral con streaming
+#7- Enviar la petición a Mistral
     response = requests.post(
         OLLAMA_URL,
         json={
-            "model": "openchat",
-            "stream": True,
+            "model": "mistral",
+            "stream": True, #Streaming, pendiente revisar performance https://docs.baseten.co/inference/streaming
             "messages": messages
         },
         stream=True
@@ -239,12 +330,12 @@ def main(query: str) -> str:
     end_time = time.time()
     duration = end_time - start_time
 
-#7- Guardar pregunta y respuesta como par en Redis
+#8- Guardar pregunta y respuesta como par en Redis y Elastic
     message_id = generar_id_mensaje()
     guardar_mensaje(message_id, "user", query)
     guardar_mensaje(message_id, "assistant", assistant_response)
 
-#8- Print de resultados y toda la vaina
+#9- Print de resultados y toda la vaina
     print("\n\n*****************************")
     print(f"📄 IDs de documentos utilizados: {ids}")
     print(f"⏱ Tiempo total de generación: {duration:.2f} segundos")
