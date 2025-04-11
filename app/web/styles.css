@@ -167,7 +167,7 @@ button:hover {
 #send-button {
   position: absolute;
   right: 10px;
-  top: 15%;
+  top: 20%;
   cursor: pointer;
   font-size: 25px;
   color: #333;
